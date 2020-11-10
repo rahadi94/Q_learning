@@ -90,15 +90,15 @@ for iteration in range(1):
 
     # Run simulation
     sim = Model(env, vehicles=vehicles, charging_stations=charging_stations, zones=zones, parkings=parkings,
-                simulation_time=1440 * 0.1)
+                simulation_time=1440 * 1)
     for zone in zones:
         env.process(sim.trip_generation(zone=zone))
     env.process(sim.run())
     for vehicle in vehicles:
         env.process(sim.run_vehicle(vehicle))
-
     env.process(sim.hourly_charging())
-    env.process(sim.charging_interruption())
+    for vehicle in vehicles:
+        env.process(sim.charging_interruption(vehicle))
 
     for vehicle in vehicles:
         env.process(sim.obs_Ve(vehicle=vehicle))

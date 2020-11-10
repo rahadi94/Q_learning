@@ -7,9 +7,9 @@ import requests
 import osmnx as ox
 import networkx as nx
 # ox.config(use_cache=True, log_console=True)
-from Fleet_sim.read1 import G
+# from Fleet_sim.read1 import G
 
-network = nx.Graph(G)
+# network = nx.Graph(G)
 
 '''def find_zone(loc, zones):
     hexagon = h3.geo_to_h3(loc.long, loc.lat, 7)
@@ -41,12 +41,14 @@ class Location:
         destination = [loc.lat, loc.long]
         return geodesic(origin, destination).kilometers
 
-    '''def distance(self, loc):
+    def distance(self, loc):
         origin = [self.lat, self.long]
         destination = [loc.lat, loc.long]
-        return geodesic(origin, destination).kilometers'''
+        dis = geodesic(origin, destination).kilometers
+        dur = dis / 0.5
+        return [dis, dur]
 
-    def distance(self, loc):
+    '''def distance(self, loc):
         try:
             orig = ox.get_nearest_node(G, (self.lat, self.long))
             dest = ox.get_nearest_node(G, (loc.lat, loc.long))
@@ -61,7 +63,7 @@ class Location:
             destination = [loc.lat, loc.long]
             dis = geodesic(origin, destination).kilometers
             dur = dis/0.5
-            return [dis, dur]
+            return [dis, dur]'''
 
     '''def distance(self, loc):
         wp_1_long = self.long

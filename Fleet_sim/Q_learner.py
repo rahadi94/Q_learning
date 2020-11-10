@@ -1,52 +1,102 @@
 import numpy as np
+import pandas as pd
+import logging
 
+lg = logging.getLogger(__name__)
+lg.setLevel(logging.INFO)
+
+formatter = logging.Formatter('%(name)s:%(message)s')
+
+file_handler = logging.FileHandler('report.log')
+file_handler.setFormatter(formatter)
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+stream_handler.setLevel(logging.INFO)
+
+lg.addHandler(file_handler)
+lg.addHandler(stream_handler)
 
 class RL_agent:
-    def __init__(self, env):
+    def __init__(self, env, episode):
         self.env = env
-        self.q_table = dict()
-        for i in range(10):
-            for ii in range(24):
-                for iii in range(89):
-                    for iiii in range(50):
-                        for iiiii in range(50):
-                            state = dict(SOC=i, time=ii, position=iii, supply=iiii, waiting_list=iiiii)
-                            self.q_table[state['SOC'], state['time'], state['position'],
-                                         state['supply'], state['waiting_list']] = [round(np.random.uniform(-1, 0), 2)
-                                                                                    for i in range(2)]
+        SOC = range(11)
+        time = range(24)
+        position = range(89)
+        supply = range(4)
+        queue = range(2)
+        waiting_list = range(4)
+        if episode == 1:
+            index = pd.MultiIndex.from_product([SOC, time, position, supply, queue, waiting_list],
+                                               names=['SOC', 'time', 'position', 'supply', 'queue', 'waiting_list'])
+            self.q_table = pd.DataFrame(-np.random.rand(len(index), 2), index=index)
+        else:
+            self.q_table = pd.read_csv('q_table.csv')
+            self.q_table = self.q_table.set_index(['SOC', 'time', 'position', 'supply', 'queue', 'waiting_list'])
 
-    def get_state(self, vehicle, vehicles, waiting_list):
-        for i in range(10):
-            if i * 10 <= vehicle.charge_state <= (i + 1) * 10:
-                SOC = i
+    def get_state(self, vehicle, charging_station, vehicles, waiting_list):
+        SOC = int((vehicle.charge_state - vehicle.charge_state % 10) / 10)
+        if isinstance(SOC, np.ndarray):
+            SOC = SOC[0]
         for j in range(0, 24):
             if j * 60 <= self.env.now % 1440 <= (j + 1) * 60:
                 hour = j
         position = vehicle.position.id
         supply = len([v for v in vehicles if v.location.distance_1(vehicle.location) <= 2 and v.charge_state >= 30])
-        wl = len([t for t in waiting_list if t.origin.distance_1(vehicle.location) <= 2])
-        return (SOC, hour, position, supply, wl)
-
-    def take_action(self, vehicle, vehicles, waiting_list):
-        epsilon = 0.1
-        state = self.get_state(vehicle, vehicles, waiting_list)
-        if np.random.random() > epsilon:
-            action = np.argmax(self.q_table[state])
+        if supply < 5:
+            supply = 0
+        elif supply < 10:
+            supply = 1
+        elif supply < 20:
+            supply = 2
         else:
-            action = np.random.randint(0, 1)
+            supply = 3
+        wl = len([t for t in waiting_list if t.origin.distance_1(vehicle.location) <= 2])
+        if wl < 5:
+            wl = 0
+        elif wl < 10:
+            wl = 1
+        elif wl < 20:
+            wl = 2
+        else:
+            wl = 3
+        q = len(charging_station.plugs.queue)
+        if q == 0:
+            queue = 0
+        else:
+            queue = 1
+        return (SOC, hour, position, supply, queue, wl)
+
+    def take_action(self, vehicle, charging_station, vehicles, waiting_list):
+        epsilon = 0.1
+        state = self.get_state(vehicle, charging_station, vehicles, waiting_list)
+        if np.random.random() > epsilon:
+            action = np.argmax(self.q_table.loc[state])
+        else:
+            action = np.random.randint(0, 2)
         vehicle.old_state = state
-        vehicle.old_q = self.q_table[state][action]
+        # print(f'state is {vehicle.old_state} and action is {action}')
         vehicle.old_action = action
         vehicle.old_time = self.env.now
-        vehicle.reward['missed_trips'] = 0
+        vehicle.reward['revenue'] = 0
+
         return action
 
-    def update_value(self, vehicle, vehicles, waiting_list):
+    def update_value(self, vehicle, charging_station, vehicles, waiting_list):
         alpha = 0.1
         GAMMA = 0.5
-        state = self.get_state(vehicle, vehicles, waiting_list)
-        q = max(self.q_table[state])
-        vehicle.r = vehicle.reward['charging'] / 100 + vehicle.reward['distance'] / 10 + vehicle.reward[
-            'missed_trips']
-        self.q_table[vehicle.old_state][vehicle.old_action] = vehicle.old_q + \
-                                                              alpha * (vehicle.r + GAMMA * q - vehicle.old_q)
+        state = self.get_state(vehicle, charging_station, vehicles, waiting_list)
+        q = float(max(self.q_table.loc[state]))
+        vehicle.r = -(vehicle.reward['charging'] + vehicle.reward['distance'] * 0.80 - vehicle.reward[
+            'revenue'] + vehicle.reward['queue'] / 30)
+
+        vehicle.old_q = self.q_table.loc[vehicle.old_state][vehicle.old_action]
+
+        '''print(f'state is {state}')
+        print(f'old_q is {vehicle.old_q}')
+        print(f'q is {q}')
+        print(f'r is {vehicle.reward}')
+        print(f'q{vehicle.old_state} is updated')'''
+        self.q_table.loc[vehicle.old_state][vehicle.old_action] = vehicle.old_q + \
+                                                                      alpha * (vehicle.r + GAMMA * q - vehicle.old_q)
+
