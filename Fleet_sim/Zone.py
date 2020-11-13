@@ -16,4 +16,4 @@ class Zone:
 
     def update(self, vehicles):
         self.list_of_vehicles = [vehicle for vehicle in vehicles
-                                 if vehicle.position == self.id and vehicle.mode in ['idle', 'parking']]
+                                 if vehicle.position == self.id and vehicle.mode in ['idle', 'parking', 'relocating']]

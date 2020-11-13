@@ -1,19 +1,19 @@
 from Fleet_sim.charging_station import ChargingStation
 from Fleet_sim.location import Location
-from Fleet_sim.model import Model
+from Fleet_sim.model import Model, lg
 import simpy
 import random
 from Fleet_sim.parking import Parking
 from Fleet_sim.read import zones
 from Fleet_sim.vehicle import Vehicle
 
-
-for iteration in range(1):
-    print(f'iteration:{iteration}')
+for episode in range(1):
+    lg.info(f'iteration:{episode}')
+    print(f'iteration:{episode}')
     env = simpy.Environment()
 
-    # Initialize Vehicles
 
+    # Initialize Vehicles
 
     def generate_location():
         return Location(random.uniform(52.40, 52.60), random.uniform(13.25, 13.55))
@@ -90,13 +90,13 @@ for iteration in range(1):
 
     # Run simulation
     sim = Model(env, vehicles=vehicles, charging_stations=charging_stations, zones=zones, parkings=parkings,
-                simulation_time=1440 * 1)
+                simulation_time=1440 * 0.4, episode=episode)
     for zone in zones:
         env.process(sim.trip_generation(zone=zone))
     env.process(sim.run())
     for vehicle in vehicles:
         env.process(sim.run_vehicle(vehicle))
-    env.process(sim.hourly_charging())
+    env.process(sim.hourly_charging_relocating())
     for vehicle in vehicles:
         env.process(sim.charging_interruption(vehicle))
 
@@ -117,7 +117,7 @@ for iteration in range(1):
     for vehicle in vehicles:
         pd_ve = pd_ve.append(pd.DataFrame(vehicle.count_seconds.values()).transpose())
     pd_ve.to_csv('vehicles.csv')'''
-    sim.save_results(iteration)
+    sim.save_results(episode)
 """
 Extension and debugs:
 . Critical:
