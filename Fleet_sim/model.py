@@ -1,0 +1,470 @@
+import pandas as pd
+import numpy as np
+import simpy
+from Fleet_sim.location import find_zone
+from Fleet_sim.logging import lg
+from Fleet_sim.read import charging_cost
+from Fleet_sim.trip import Trip
+from Fleet_sim.Q_learner import RL_agent
+
+
+# This function give us the available vehicles for a trip
+def available_vehicle(vehicles, trip, SOC_threshold=20, max_distance=10):
+    available_vehicles = list()
+    for vehicle in vehicles:
+        if vehicle.mode in ['idle', 'parking', 'circling', 'queue']:
+            distance_to_pickup = vehicle.location.distance_1(trip.origin)
+            if distance_to_pickup <= max_distance:
+                distance_to_dropoff = trip.distance
+                charge_consumption = (distance_to_pickup + distance_to_dropoff) * \
+                                     vehicle.fuel_consumption * 100.0 / vehicle.battery_capacity
+                if charge_consumption + SOC_threshold <= vehicle.charge_state:
+                    available_vehicles.append(vehicle)
+    return available_vehicles
+
+
+class Model:
+
+    def __init__(self, env, vehicles, charging_stations, zones, parkings, simulation_time, episode):
+        self.t = []
+        self.episode = episode
+        self.parkings = parkings
+        self.zones = zones
+        self.charging_stations = charging_stations
+        self.vehicles = vehicles
+        self.trip_list = []
+        self.waiting_list = []
+        self.simulation_time = simulation_time
+        self.env = env
+        self.trip_start = env.event()
+        self.demand_generated = []
+        self.utilization = []
+        self.vehicle_id = None
+        self.learner = RL_agent(env, episode=self.episode + 1)
+
+    def park(self, vehicle, parking):
+        if self.env.now <= 5:
+            vehicle.parking(parking)
+            yield vehicle.parking_stop
+        else:
+            if vehicle.mode == 'idle':
+                vehicle.mode = 'circling'
+                lg.info(f'vehicle {vehicle.id} starts cruising at {self.env.now}')
+                circling_interruption = vehicle.circling_stop
+                vehicle.t_start_circling = self.env.now
+                circling_finish = self.env.timeout(10)
+                parking_events = yield circling_interruption | circling_finish
+                if circling_interruption in parking_events:
+                    # vehicle.charge_state -= (10 * 0.5 * 15 / 100 * 2)
+                    lg.info(f'vehicle {vehicle.id} interrupts cruising at {self.env.now}')
+                if circling_finish in parking_events:
+                    lg.info(f'vehicle {vehicle.id} stops cruising at {self.env.now}')
+                    circling_time = self.env.now - vehicle.t_start_circling
+                    # vehicle.charge_state -= (circling_time * 0.5 * 15 / 100 * 2)
+                    vehicle.send_parking(parking)
+                    yield self.env.timeout(vehicle.time_to_parking)
+                    vehicle.parking(parking)
+                    yield vehicle.parking_stop
+
+    def parking_task(self, vehicle):
+        if vehicle.mode in ['circling', 'idle']:
+            # Finding the closest free parking (what if there is no available parking?)
+            free_PL = [x for x in self.parkings if len(x.capacity.queue) == 0]
+            if len(free_PL) >= 1:
+                distances_to_PLs = [vehicle.location.distance_1(PL.location) for PL in free_PL]
+                parking = [x for x in free_PL
+                                    if x.location.distance_1(vehicle.location) == min(distances_to_PLs)][0]
+                with parking.capacity.request() as req:
+                    yield req
+                    yield self.env.process(self.park(vehicle, parking))
+
+    def relocate(self, vehicle, target_zone):
+        vehicle.relocate(target_zone)
+        target_zone.update(self.vehicles)
+        yield self.env.timeout(vehicle.time_to_relocate)
+        vehicle.finish_relocating(target_zone)
+        vehicle.relocating_end.succeed()
+        vehicle.relocating_end = self.env.event()
+
+    def relocate_check(self, vehicle):
+        for zone in self.zones:
+            zone.update(self.vehicles)
+        vehicle.position = find_zone(vehicle.location, self.zones)
+        time = self.env.now
+        for i in range(0, 24):
+            if i * 60 <= time % 1440 <= (i + 1) * 60:
+                hour = i
+        if vehicle.charge_state >= 50 and vehicle.mode in ['idle', 'parking'] and len(
+                vehicle.position.list_of_vehicles) >= vehicle.position.demand.iloc[0, hour]:
+            return True
+
+    def relocate_task(self, vehicle):
+        time = self.env.now
+        for i in range(0, 24):
+            if i * 60 <= time % 1440 <= (i + 1) * 60:
+                hour = i
+        target_zones = [z for z in self.zones if len(z.list_of_vehicles) <= z.demand.iloc[0, hour]]
+        if len(target_zones) > 1:
+            distances_to_zones = [vehicle.location.distance_1(z.centre) for z in target_zones]
+            target_zone = [z for z in target_zones
+                           if z.centre.distance_1(vehicle.location) == min(distances_to_zones)][0]
+            if vehicle.mode == 'parking':
+                vehicle.parking_stop.succeed()
+                vehicle.parking_stop = self.env.event()
+            self.env.process(self.relocate(vehicle, target_zone))
+
+    def start_charge(self, charging_station, vehicle):
+        vehicle.send_charge(charging_station)
+        vehicle.charging_demand = dict(vehicle_id=vehicle.id, time_send=self.env.now,
+                                       time_enter=self.env.now + vehicle.time_to_CS,
+                                       time_start=None, SOC_end=None,
+                                       SOC_send=vehicle.charge_state, lat=vehicle.location.lat,
+                                       long=vehicle.location.long,
+                                       v_hex=vehicle.position.hexagon,
+                                       CS_location=[charging_station.location.lat, charging_station.location.long],
+                                       v_position=vehicle.position.id, CS_position=charging_station.id,
+                                       distance=vehicle.location.distance(charging_station.location)[0])
+        yield self.env.timeout(vehicle.time_to_CS)
+        vehicle.charging(charging_station)
+        vehicle.t_arriving_CS = self.env.now
+
+    def finish_charge(self, charging_station, vehicle):
+        try:
+            yield self.env.timeout(vehicle.charge_duration)
+            vehicle.finish_charging(charging_station)
+            vehicle.charging_demand['SOC_end'] = vehicle.charge_state
+            vehicle.charging_end.succeed()
+            vehicle.charging_end = self.env.event()
+        except simpy.Interrupt:
+            old_SOC = vehicle.charge_state
+            vehicle.charge_state += (charging_station.power * (self.env.now - vehicle.t_start_charging)) \
+                                    / (vehicle.battery_capacity / 100)
+            vehicle.charging_demand['SOC_end'] = vehicle.charge_state
+            vehicle.mode = 'idle'
+            vehicle.charging_interrupt.succeed()
+            vehicle.charging_interrupt = self.env.event()
+            for j in range(0, 24):
+                if j * 60 <= self.env.now % 1440 <= (j + 1) * 60:
+                    h = j
+            vehicle.reward['charging'] = (vehicle.charge_state - old_SOC) / 100 * 50 * charging_cost[h] / 100
+            if isinstance(vehicle.reward['charging'], np.ndarray):
+                vehicle.reward['charging'] = vehicle.reward['charging'][0]
+            vehicle.costs['charging'] += (vehicle.charging_threshold - vehicle.charge_state) * \
+                                         charging_cost[h] / 100
+            lg.info(f'Warning!!!Charging state of vehicle {vehicle.id} is {vehicle.charge_state} at {self.env.now} ')
+
+    def charge_check(self, vehicle):
+        if self.env.now > 10 and vehicle.mode in ['idle', 'parking']:
+            distances_to_CSs = [vehicle.location.distance_1(CS.location) for CS in self.charging_stations]
+            charging_station = [x for x in self.charging_stations
+                                if x.location.distance_1(vehicle.location) == min(distances_to_CSs)][0]
+            if vehicle.charging_count > 0:
+                self.learner.update_value(vehicle, charging_station, self.vehicles, self.waiting_list)
+            action = self.learner.take_action(vehicle, charging_station, self.vehicles, self.waiting_list)
+            vehicle.charging_count += 1
+            if action == 1:
+                vehicle.reward['distance'] = 0
+                vehicle.reward['charging'] = 0
+                vehicle.reward['queue'] = 0
+            return action
+
+    def charge_task(self, vehicle):
+        # Finding the closest charging station
+        distances_to_CSs = [vehicle.location.distance_1(CS.location) for CS in self.charging_stations]
+        charging_station = [x for x in self.charging_stations
+                            if x.location.distance_1(vehicle.location) == min(distances_to_CSs)][0]
+        yield self.env.process(self.start_charge(charging_station, vehicle))
+        req = charging_station.plugs.request()
+        vehicle.mode = 'queue'
+        events = yield req | vehicle.queue_interruption
+
+        if req in events:
+            vehicle.charging_demand['time_start'] = self.env.now
+            lg.info(f'Vehicle {vehicle.id} starts charging at {self.env.now}')
+            vehicle.t_start_charging = self.env.now
+            vehicle.reward['queue'] = (vehicle.t_start_charging - vehicle.t_arriving_CS)
+            if isinstance(vehicle.reward['queue'], np.ndarray):
+                vehicle.reward['queue'] = vehicle.reward['queue'][0]
+            vehicle.mode = 'charging'
+            charging = self.env.process(self.finish_charge(charging_station, vehicle))
+            yield charging | vehicle.charging_interruption
+            lg.info(f'counts and queue of CS {charging_station.id} are '
+                    f'{charging_station.plugs.count},{len(charging_station.plugs.queue)}')
+            charging_station.plugs.release(req)
+            req.cancel()
+            lg.info(f'counts and queue of CS {charging_station.id} are '
+                    f'{charging_station.plugs.count},{len(charging_station.plugs.queue)}')
+
+            if not charging.triggered:
+                charging.interrupt()
+                lg.info(f'Vehicle {vehicle.id} stops charging at {self.env.now}')
+                return
+
+        else:
+            vehicle.reward['queue'] = (self.env.now - vehicle.t_arriving_CS)
+            vehicle.charging_demand['SOC_end'] = vehicle.charge_state
+            lg.info(f'vehicle {vehicle.id} interrupts the queue')
+            lg.info(f'counts and queue of CS {charging_station.id} are '
+                    f'{charging_station.plugs.count},{len(charging_station.plugs.queue)}')
+            req.cancel()
+            charging_station.plugs.release(req)
+            lg.info(f'counts and queue of CS {charging_station.id} are '
+                    f'{charging_station.plugs.count},{len(charging_station.plugs.queue)}')
+            return
+        self.demand_generated.append(vehicle.charging_demand)
+
+    def discharging(self, vehicle, charging_station):
+        vehicle.discharging(charging_station)
+        yield self.env.timeout(vehicle.discharge_duration)
+        vehicle.finish_discharging(charging_station)
+        vehicle.discharging_end.succeed()
+        vehicle.discharging_end = self.env.event()
+
+    '''def discharging_check(self, vehicle):
+        for zone in self.zones:
+            zone.update(self.vehicles)
+        vehicle.position = find_zone(vehicle.location, self.zones)
+        time = self.env.now
+        for i in range(0, 24):
+            if i * 60 <= time % 1440 <= (i + 1) * 60:
+                hour = i
+        if vehicle.charge_state >= 80 and vehicle.mode in ['idle'] and len(
+                vehicle.position.list_of_vehicles) >= vehicle.position.demand.iloc[0, hour]:
+            return True'''
+
+    def discharge_task(self, vehicle):
+        free_CS = [x for x in self.charging_stations if len(x.plugs.queue) == 0]
+        if len(free_CS) >= 1:
+            distances_to_CSs = [vehicle.location.distance_1(CS.location) for CS in free_CS]
+            charging_station = [x for x in free_CS
+                                if x.location.distance_1(vehicle.location) == min(distances_to_CSs)][0]
+            vehicle.send_charge(charging_station)
+            lg.info(f'vehicle {vehicle.id} is sent for discharging')
+            yield self.env.timeout(vehicle.time_to_CS)
+            with charging_station.plugs.request() as req1:
+                yield req1
+                lg.info(f'Vehicle {vehicle.id} starts discharging at {self.env.now}')
+                yield self.env.process(self.discharging(vehicle=vehicle, charging_station=charging_station))
+        return
+
+    def take_trip(self, trip, vehicle):
+        vehicle.send(trip)
+        trip.mode = 'assigned'
+        self.waiting_list.remove(trip)
+        yield self.env.timeout(vehicle.time_to_pickup)
+        vehicle.pick_up(trip)
+        trip.mode = 'in vehicle'
+        yield self.env.timeout(trip.duration)
+        vehicle.drop_off(trip)
+        vehicle.trip_end.succeed()
+        vehicle.trip_end = self.env.event()
+        self.vehicle_id = vehicle.id
+        trip.mode = 'finished'
+        self.trip_list.append(trip)
+        trip.info['mode'] = 'finished'
+        vehicle.reward['revenue'] += max(((trip.distance * 1.11 + trip.duration * 0.31) + 2), 5)
+
+    def trip_task(self, trip):
+        available_vehicles = available_vehicle(self.vehicles, trip)
+        distances = [vehicle.location.distance_1(trip.origin) for vehicle in available_vehicles]
+        # If there is no available vehicle, add the trip to the waiting list
+        if len(available_vehicles) == 0:
+            return
+        # Assigning the closest available vehicle to the trip
+        lg.info(f'There is/are {len(available_vehicles)} available vehicle(s) for trip {trip.id}')
+        vehicle = [x for x in available_vehicles
+                   if x.location.distance_1(trip.origin) == min(distances)][0]
+        if vehicle.mode == 'parking':
+            vehicle.parking_stop.succeed()
+            vehicle.parking_stop = self.env.event()
+        if vehicle.mode == 'circling':
+            vehicle.circling_stop.succeed()
+            vehicle.circling_stop = self.env.event()
+        if vehicle.mode == 'queue':
+            vehicle.queue_interruption.succeed()
+            vehicle.queue_interruption = self.env.event()
+        self.env.process(self.take_trip(trip, vehicle))
+
+    def trip_generation(self, zone):
+        j = 0
+        # Trips are being generated randomly and cannot be rejected
+        while True:
+            j += 1
+            trip = Trip(self.env, [zone.id, j], zone)
+            yield self.env.timeout(trip.interarrival)
+            self.trip_start.succeed()
+            self.trip_start = self.env.event()
+            self.trip = trip
+            trip.info['arrival_time'] = self.env.now
+            self.waiting_list.append(trip)
+            lg.info(f'Trip {trip.id} is received at {self.env.now}')
+            trip.start_time = self.env.now
+
+    def missed_trip(self):
+        while True:
+            for trip in self.waiting_list:
+                if trip.mode == 'unassigned' and self.env.now > (trip.start_time + 5):
+                    trip.mode = 'missed'
+                    trip.info['mode'] = 'missed'
+                    self.trip_list.append(trip)
+                    self.waiting_list.remove(trip)
+                    lg.info(f'trip {trip.id} is missed at {self.env.now}')
+            yield self.env.timeout(1)
+
+    def hourly_charging_relocating(self):
+        while True:
+            for vehicle in self.vehicles:
+                action = self.charge_check(vehicle)
+                if action == 0:
+                    self.env.process(self.charge_task(vehicle))
+                    yield self.env.timeout(0.001)
+                elif action == 2:
+                    self.env.process(self.discharge_task(vehicle))
+                    yield self.env.timeout(0.001)
+                elif self.relocate_check(vehicle):
+                    self.relocate_task(vehicle)
+                    yield self.env.timeout(0.001)
+            yield self.env.timeout(120)
+
+    def charging_interruption(self, vehicle):
+        while True:
+            if vehicle.mode in ['charging']:
+                vehicle.position = find_zone(vehicle.location, self.zones)
+                vehicle.position.update(self.vehicles)
+                power = 11 / 60
+                try:
+                    duration = self.env.now - vehicle.t_start_charging
+                except:
+                    duration = 0
+                soc = vehicle.charge_state + ((power * duration) / (vehicle.battery_capacity / 100))
+                if soc > 70 and len([t for t in self.waiting_list if t.origin.distance(vehicle.location)[0] <= 4]) >= 1:
+                    vehicle.charging_interruption.succeed()
+                    vehicle.charging_interruption = self.env.event()
+            yield self.env.timeout(15)
+
+    def run(self):
+        while True:
+            yield self.trip_start
+            # for trip in self.waiting_list:
+            if self.trip.mode == 'unassigned':
+                self.trip_task(self.trip)
+                yield self.env.timeout(0.001)
+
+    def run_vehicle(self, vehicle):
+        while True:
+            # All vehicles start from parking
+            if self.env.now == 0:
+                self.env.process(self.parking_task(vehicle))
+
+            event_trip_end = vehicle.trip_end
+            event_charging_end = vehicle.charging_end
+            event_charging_interrupt = vehicle.charging_interrupt
+            event_relocating_end = vehicle.relocating_end
+            event_discharging_end = vehicle.discharging_end
+            events = yield event_trip_end | event_charging_end \
+                           | event_charging_interrupt | event_relocating_end | event_discharging_end
+
+            if event_trip_end in events:
+                lg.info(f'A vehicle gets idle at {self.env.now}')
+                action = self.charge_check(vehicle)
+                if action == 0:
+                    self.env.process(self.charge_task(vehicle))
+                    yield self.env.timeout(0.001)
+                elif action == 2:
+                    self.env.process(self.discharge_task(vehicle))
+                    yield self.env.timeout(0.001)
+                else:
+                    if self.relocate_check(vehicle):
+                        self.relocate_task(vehicle)
+                        yield self.env.timeout(0.001)
+                    else:
+                        for trip in self.waiting_list:
+                            if trip.mode == 'unassigned':
+                                self.trip_task(trip)
+                                yield self.env.timeout(0.001)
+                        self.env.process(self.parking_task(vehicle))
+                        yield self.env.timeout(0.001)
+
+            if event_charging_end in events:
+                lg.info(f'A vehicle gets charged at {self.env.now}')
+                if self.relocate_check(vehicle):
+                    self.relocate_task(vehicle)
+                    yield self.env.timeout(0.001)
+                else:
+                    for trip in self.waiting_list:
+                        if trip.mode == 'unassigned':
+                            self.trip_task(trip)
+                            yield self.env.timeout(0.001)
+                    self.env.process(self.parking_task(vehicle))
+                    yield self.env.timeout(0.001)
+
+            if event_discharging_end in events:
+                lg.info(f'A vehicle gets discharged at {self.env.now}')
+                for trip in self.waiting_list:
+                    if trip.mode == 'unassigned':
+                        self.trip_task(trip)
+                        yield self.env.timeout(0.001)
+                self.env.process(self.parking_task(vehicle))
+                yield self.env.timeout(0.001)
+
+            if event_charging_interrupt in events:
+                lg.info(f'Charging gets interrupted at {self.env.now}')
+                for trip in self.waiting_list:
+                    if trip.mode == 'unassigned':
+                        self.trip_task(trip)
+                        yield self.env.timeout(0.001)
+                self.env.process(self.parking_task(vehicle))
+                yield self.env.timeout(0.001)
+
+            if event_relocating_end in events:
+                lg.info(f'vehicle {vehicle.id} finishes relocating at {self.env.now}')
+                for trip in self.waiting_list:
+                    if trip.mode == 'unassigned':
+                        self.trip_task(trip)
+                        yield self.env.timeout(0.001)
+                self.env.process(self.parking_task(vehicle))
+                yield self.env.timeout(0.001)
+
+    def obs_Ve(self, vehicle):
+        while True:
+            t_now = self.env.now
+            self.t.append(t_now)
+            vehicle.info['SOC'].append(vehicle.charge_state)
+            vehicle.info['location'].append([vehicle.location.lat, vehicle.location.long])
+            vehicle.info['position'].append(vehicle.position)
+            vehicle.info['mode'].append(vehicle.mode)
+            yield self.env.timeout(1)
+
+    def obs_CS(self, charging_station):
+        while True:
+            charging_station.queue.append([charging_station.plugs.count, len(charging_station.plugs.queue)])
+            yield self.env.timeout(1)
+
+    def obs_PK(self, parking):
+        while True:
+            parking.queue.append(parking.capacity.count)
+            yield self.env.timeout(1)
+
+    def save_results(self, episode):
+        trips_info = []
+        for i in self.trip_list:
+            trips_info.append(i.info)
+        results = pd.DataFrame(trips_info)
+        results_charging_demand = pd.DataFrame(self.demand_generated)
+        self.learner.q_table.to_csv('q_table.csv')
+        with pd.ExcelWriter("results.xlsx", engine="openpyxl", mode='a') as writer:
+            results.to_excel(writer, sheet_name=f'Trips{episode}')
+            results_charging_demand.to_excel(writer, sheet_name=f'demand_generated{episode}')
+
+            pd_ve = pd.DataFrame()
+            for j in self.vehicles:
+                pd_ve = pd_ve.append(pd.DataFrame([j.info["mode"], j.info['SOC'], j.info['location']]))
+            pd_ve.to_excel(writer, sheet_name=f'Vehicle_{episode}')
+
+            pd_cs = pd.DataFrame()
+            for c in self.charging_stations:
+                pd_cs = pd_cs.append([c.queue])
+            pd_cs.to_excel(writer, sheet_name=f'CS_{episode}')
+
+            """for p in self.parkings:
+                pd.DataFrame([p.queue]).to_excel(writer, sheet_name='PK_%s' % p.id)"""
