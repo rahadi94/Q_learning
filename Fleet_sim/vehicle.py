@@ -61,6 +61,8 @@ class Vehicle:
         self.queue_interruption = env.event()
         self.discharging_end = env.event()
         self.reward = dict(charging=0, queue=0, distance=0, revenue=0)
+        self.total_rewards = dict(state=[], action=[], reward=[])
+        self.profit = 0
         self.old_action = 0
         self.old_state = (0, 0, 0, 0, 0, 0)
         self.charging_count = 0

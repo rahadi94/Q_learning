@@ -137,8 +137,8 @@ class Model:
             vehicle.charging_end = self.env.event()
         except simpy.Interrupt:
             old_SOC = vehicle.charge_state
-            vehicle.charge_state += (charging_station.power * (self.env.now - vehicle.t_start_charging)) \
-                                    / (vehicle.battery_capacity / 100)
+            vehicle.charge_state += float((charging_station.power * (float(self.env.now) - vehicle.t_start_charging)) \
+                                    / (vehicle.battery_capacity / 100))
             vehicle.charging_demand['SOC_end'] = vehicle.charge_state
             vehicle.mode = 'idle'
             vehicle.charging_interrupt.succeed()
@@ -245,7 +245,6 @@ class Model:
                 yield req1
                 lg.info(f'Vehicle {vehicle.id} starts discharging at {self.env.now}')
                 yield self.env.process(self.discharging(vehicle=vehicle, charging_station=charging_station))
-        return
 
     def take_trip(self, trip, vehicle):
         vehicle.send(trip)
@@ -324,7 +323,7 @@ class Model:
                 elif self.relocate_check(vehicle):
                     self.relocate_task(vehicle)
                     yield self.env.timeout(0.001)
-            yield self.env.timeout(120)
+            yield self.env.timeout(60)
 
     def charging_interruption(self, vehicle):
         while True:
@@ -457,9 +456,13 @@ class Model:
             results_charging_demand.to_excel(writer, sheet_name=f'demand_generated{episode}')
 
             pd_ve = pd.DataFrame()
+            pd_reward = pd.DataFrame()
             for j in self.vehicles:
                 pd_ve = pd_ve.append(pd.DataFrame([j.info["mode"], j.info['SOC'], j.info['location']]))
+                pd_reward = pd_reward.append(pd.DataFrame([j.total_rewards['state'], j.total_rewards['action'],
+                                             j.total_rewards['reward']]))
             pd_ve.to_excel(writer, sheet_name=f'Vehicle_{episode}')
+            pd_reward.to_excel(writer, sheet_name=f'rewards_{episode}')
 
             pd_cs = pd.DataFrame()
             for c in self.charging_stations:

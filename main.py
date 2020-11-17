@@ -90,7 +90,7 @@ for episode in range(1):
 
     # Run simulation
     sim = Model(env, vehicles=vehicles, charging_stations=charging_stations, zones=zones, parkings=parkings,
-                simulation_time=1440 * 0.4, episode=episode)
+                simulation_time=1440 * 0.05, episode=episode)
     for zone in zones:
         env.process(sim.trip_generation(zone=zone))
     env.process(sim.run())
@@ -117,6 +117,10 @@ for episode in range(1):
     for vehicle in vehicles:
         pd_ve = pd_ve.append(pd.DataFrame(vehicle.count_seconds.values()).transpose())
     pd_ve.to_csv('vehicles.csv')'''
+    total_profit = 0
+    for vehicle in vehicles:
+        total_profit += vehicle.profit
+    print(total_profit)
     sim.save_results(episode)
 """
 Extension and debugs:
